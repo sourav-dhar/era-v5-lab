@@ -12,6 +12,20 @@ import torch
 
 NS_COEFFS = (3.4445, -4.7750, 2.0315)
 MUON = {"momentum": 0.95, "nesterov": True, "ns_steps": 5}
+# A row whose gradient norm is at most this share of its matrix's largest row norm has no gradient signal.
+IDLE_ROW_REL = 1e-6
+
+
+def live_rows(grads):
+    """[n, rows, 1], True where a row of a same-shape gradient stack has gradient signal.
+
+    The fused MoE gives an expert that saw no tokens an all-zero gradient (not None), and its router row a gradient
+    of about 1e-10 (rounding only: the renormalised top-k gate does not depend on unchosen experts). Newton-Schulz
+    scales every direction it gets to full size, so those rows would otherwise take a normal step from stale momentum.
+    An all-zero matrix has no live rows.
+    """
+    norms = torch.stack(grads).float().norm(dim=-1, keepdim=True)
+    return norms > IDLE_ROW_REL * norms.amax(dim=1, keepdim=True)
 
 
 def _native_bf16():
@@ -83,9 +97,14 @@ class Muon(torch.optim.Optimizer):
             for (shape, _), ps in by_shape.items():
                 bufs = [self.state[p]["buf"] for p in ps]
                 grads = [p.grad for p in ps]
-                torch._foreach_lerp_(bufs, grads, 1 - group["momentum"])
-                gs = torch._foreach_lerp(grads, bufs, group["momentum"]) if group["nesterov"] else bufs
-                U = zeropower_batched(torch.stack(gs), group["ns_steps"])
+                # Rows with no gradient signal (an expert that saw no tokens, or its router row) keep their weights
+                # and momentum, as a missing gradient does. Rows with a gradient update exactly as before.
+                live = live_rows(grads)
+                B, G = torch.stack(bufs), torch.stack(grads)
+                B = torch.where(live, B.lerp(G, 1 - group["momentum"]), B)
+                torch._foreach_copy_(bufs, list(B.unbind(0)))
+                gs = G.lerp(B, group["momentum"]) if group["nesterov"] else B
+                U = zeropower_batched(gs * live, group["ns_steps"]) * live
                 if group["weight_decay"]:
                     torch._foreach_mul_(ps, 1 - group["lr"] * group["weight_decay"])
                 alpha = -group["lr"] * max(1.0, shape[0] / shape[1]) ** 0.5
